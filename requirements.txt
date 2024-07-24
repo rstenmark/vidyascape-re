@@ -1,0 +1,14 @@
+requests
+matplotlib
+pillow
+
+scikit-learn
+numpy
+
+tqdm
+
+black
+
+# packet_analysis.py
+pyshark
+levenshtein
