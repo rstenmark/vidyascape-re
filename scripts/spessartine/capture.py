@@ -1,89 +1,59 @@
 # capture.py
 
+import pathlib
+import time
+
 import pyshark
 import sqlite3
-import datetime
-import pathlib
-import pickle
-import hashlib
-import lzma
 import logging
+import spessartine
+from spessartine import pack
 from multiprocessing import Process, Queue, TimeoutError
 
 
-# Common paths
-root_path: pathlib.Path = pathlib.Path(__file__).parent.resolve()
-db_path = root_path / "capture.sqlite3"
-log_path = root_path / "capture.log"
-
-# Configure datetime
-tz = datetime.timezone.utc
-dt_start = datetime.datetime.now(tz=tz)
-
-# Configure logging
-logging.basicConfig(filename=log_path, level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-
-# Configure LZMA compression
-if lzma.is_check_supported(lzma.CHECK_SHA256):
-    check = lzma.CHECK_SHA256
-else:
-    logger.warning(
-        "lzma: Integrity check SHA256 is not supported by this version of liblzma. Falling back to CRC32."
-    )
-    check = lzma.CHECK_CRC32
-
-# Configure packet capture
-interface = "utun4"
-display_filter = "ip.addr==50.116.63.13 and data"
-n_packets = 100
-
-
-def print_and_log(
-    logger_: logging.Logger,
-    s_: str,
-    level: logging.INFO | logging.WARNING | logging.ERROR = logging.INFO,
-):
-    match level:
-        case logging.INFO:
-            logger_.info(s_)
-        case logging.WARNING:
-            logger_.warning(s_)
-        case logging.ERROR:
-            logger_.error(s_)
-
-
-def capture(data: Queue, signal: Queue):
-    """Captures batches of packets and puts them on the ``data`` queue until ``signal`` queue is not empty.
-
-    Intended for use with ``multiprocessing.Process``:
-
-    p = Process(target=capture, args=(data_queue, signal_queue))
-    """
-    with pyshark.LiveCapture(
-        interface=interface, display_filter=display_filter
-    ) as live_capture:
-        # Loop until the main process puts something on the signal queue
-        while signal.empty():
-            # Capture a batch of packets and put them on the data queue
-            data.put(live_capture.sniff_continuously(packet_count=n_packets))
+# def capture(
+#     data: Queue, signal: Queue, display_filter="ip.addr==50.116.63.13 and data"
+# ):
+#     """Captures batches of packets and puts them on the ``data`` queue until ``signal`` queue is not empty.
+# 
+#     Intended for use with ``multiprocessing.Process``:
+# 
+#     p = Process(target=capture, args=(data_queue, signal_queue))
+#     """
+#     with pyshark.LiveCapture(
+#         interface=spessartine.Net.interface_name, display_filter=display_filter
+#     ) as live_capture:
+#         # Loop until the main process puts something on the signal queue
+#         #  while signal.empty():
+#         try:
+#             #
+#             for packet in live_capture.sniff_continuously(packet_count=)
+#                 [packet for packet in live_capture.sniff_continuously(packet_count=10)]
+#             )
+#         except KeyboardInterrupt:
+#             break
 
 
 if __name__ == "__main__":
-    print_and_log(logger, f"Started execution at: {dt_start}")
+    sender = pathlib.Path(__file__).name
+    spessartine.Log.log(sender, "Started execution.")
 
     # Initialize database
     try:
-        _ = open(db_path, "x+b").close()  # raises FileExistsError if db_path exists
-        print_and_log(logger, f"Initializing database file: {db_path}")
-        with sqlite3.connect(db_path) as con:
+        _ = open(
+            spessartine.FilePath.database, "x+b"
+        ).close()  # raises FileExistsError if db_path exists
+        spessartine.Log.log(
+            sender, f"Initializing database file: {spessartine.FilePath.database}"
+        )
+        with sqlite3.connect(spessartine.FilePath.database) as con:
             con.execute(
                 """
                 CREATE TABLE IF NOT EXISTS capture
                 (
                     id INTEGER UNIQUE NOT NULL PRIMARY KEY ASC, 
-                    capture BLOB NOT NULL ON CONFLICT ABORT, 
+                    capture BLOB NOT NULL ON CONFLICT ABORT,
+                    sizePackets INTEGER NOT NULL ON CONFLICT ABORT,
                     blake2b STRING UNIQUE NOT NULL ON CONFLICT ABORT, 
                     iso8601 STRING NOT NULL ON CONFLICT ABORT
                 );
@@ -94,59 +64,73 @@ if __name__ == "__main__":
         # Database already initialized, skip step
         pass
 
-    # Start capturing batches of packets in a separate process.
-    print_and_log(
-        logger,
-        f'Beginning live capture: interface="{interface}", display_filter="{display_filter}"',
-    )
-    data_queue, signal_queue = Queue(maxsize=128), Queue(maxsize=1)
-    p = Process(target=capture, args=(data_queue, signal_queue))
-    p.start()
+    # sqlite3: Connect to DB, get a cursor
+    con = sqlite3.connect(spessartine.FilePath.database, timeout=10)
+    cur = con.cursor()
 
-    # Consume batches of packets until KeyboardInterrupt raised.
+    # pyshark: Create a capture using a ring buffer
+    tcp_bidi_data_only, thirty_two_MB = "ip.addr==50.116.63.13 and data", 32 * 1024
+    live_capture = pyshark.LiveRingCapture(interface=spessartine.Net.interface_name, display_filter=tcp_bidi_data_only, ring_file_size=thirty_two_MB)
+    del tcp_bidi_data_only, thirty_two_MB
+
+
+    poll_rate_s = 1 / 16
     while True:
         try:
-            # Block until a batch of packets has been put on the data queue
-            packets = [packet for packet in data_queue.get(block=True)]
+            tick = time.monotonic()
 
-            # Pickle and then compress batch
-            compressor = lzma.LZMACompressor(
-                format=lzma.FORMAT_XZ, check=check, preset=9
-            )
-            capture_pickle_xz = (
-                compressor.compress(pickle.dumps(packets)) + compressor.flush()
-            )
 
-            # Hash compressed pickle
-            blake2b = hashlib.blake2b(capture_pickle_xz).hexdigest()[1:]
 
-            # Write batch to disk
-            s = f"Writing capture to disk: {len(packets)} packets, {len(capture_pickle_xz)} bytes, blake2b={blake2b}"
-            logger.info(s)
-            print(s)
-            with sqlite3.connect(db_path) as con:
+            tock = time.monotonic()
+            time.sleep(max(poll_rate_s, poll_rate_s - (tock -  tick)))
+        except KeyboardInterrupt:
+            # pyshark: Stop the capture
+            live_capture.close()
+
+    # sqlite3: Commit any pending transactions then close connection
+    con.commit()
+    con.close()
+
+    with sqlite3.connect(spessartine.FilePath.database) as con:
+        with pyshark.LiveCapture(
+                interface=spessartine.Net.interface_name, display_filter="ip.addr==50.116.63.13 and data"
+        ) as live_capture:
+        while True:
+            try:
+
+                buffer = []
+                while len(buffer) < 100:
+                    # Block until a batch of packets has been put on the data queue.
+                    buffer.extend(data_queue.get(block=True))
+
+                # Pickle, compress batch. Compute blake2b hash of pickled, compressed batch.
+                xz, digest = pack(buffer, do_compress=False)
+                # Write batch to disk
+                spessartine.Log.log(
+                    sender,
+                    f"Writing capture to disk: {len(buffer)} packets, {len(xz)} bytes, blake2b={digest}",
+                )
                 con.execute(
-                    "INSERT OR ABORT INTO capture (capture, blake2b, iso8601) VALUES (?, ?, ?)",
-                    (capture_pickle_xz, blake2b, str(dt_start)),
+                    "INSERT OR ABORT INTO capture (capture, sizePackets, blake2b, iso8601) VALUES (?, ?, ?, ?)",
+                    (xz, len(buffer), digest, spessartine.Time.now()),
                 )
                 con.commit()
-        except KeyboardInterrupt:
-            # Signal child process to terminate
-            signal_queue.put(0)
-            s = f"KeyboardInterrupt: Signalled child processes to terminate."
-            logger.info(s)
-            print(s)
-            timeout = 10
-            # Block until child process terminated
-            try:
-                s = f"Waiting {timeout} seconds for child processes to terminate..."
-                logger.info(s)
-                print(s)
-                p.join(timeout=timeout)
-            except TimeoutError:
-                s = f"TimeoutError: Child process termination timed out. Forcibly terminating children."
-                logger.warning(s)
-                print(s)
-                p.terminate()
-            # Break out of infinite loop, exit main process
-            break
+            except KeyboardInterrupt:
+                # Signal child process to terminate
+                signal_queue.put(0)
+                spessartine.Log.log(
+                    sender,
+                    f"KeyboardInterrupt: Signalled child processes to terminate.",
+                )
+                # Block until child process terminated
+                try:
+                    p.join(timeout=10)
+                except TimeoutError:
+                    spessartine.Log.log(
+                        sender,
+                        f"TimeoutError: Child process termination timed out. Forcibly terminating children.",
+                        level=logging.WARNING,
+                    )
+                    p.terminate()
+                # Break out of infinite loop, exit main process
+                break
